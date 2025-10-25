@@ -1,90 +1,199 @@
-# voice_audio_bot.py — plays a clip when a user joins any voice channel
-# Uses filenames in ./audio/ named by Discord user ID, e.g., 201986966324117504.mp3
-import os, asyncio, logging, sys, time, shutil
-from typing import Optional, Dict, Set
+# voice_audio_bot.py — robust voice connect w/ 4006 recovery, per-guild lock, simple ID→file lookup
+# Requires: pip install -U "discord.py[voice]"
+# Env vars (Render):
+#   DISCORD_TOKEN  -> your bot token (REQUIRED)
+#   AUDIO_DIR      -> optional, default "./audio"
+
+import os, sys, asyncio, logging, shutil, time
+from typing import Optional, Iterable
+
 import discord
+from discord.ext import commands
 from discord import FFmpegPCMAudio, PCMVolumeTransformer
 
 # ---------- Logging ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-log = logging.getLogger(__name__)
+logger = logging.getLogger("voice-audio-bot")
+handler = logging.StreamHandler()
+handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
-TOKEN = os.getenv("DISCORD_TOKEN")
+# ---------- Config ----------
+TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
 if not TOKEN:
-    log.error("DISCORD_TOKEN env var is required")
+    print("ERROR: Set DISCORD_TOKEN env var.", file=sys.stderr)
     sys.exit(1)
 
-AUDIO_DIR = os.path.join(os.path.dirname(__file__), "audio")
-DEFAULT_VOLUME = float(os.getenv("BOT_VOLUME", "0.30"))
-CONNECT_TIMEOUT = 15.0
-PLAYBACK_TIMEOUT = 45.0
-LINGER_SECONDS = 90
-JOIN_DEBOUNCE_SEC = 2.0   # avoid double-firing when Discord sends multiple states
-FAIL_WINDOW_SEC = 300
-MAX_FAILS = 3
+AUDIO_DIR = os.getenv("AUDIO_DIR", "./audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
+# Tuneables
+LINGER_SECONDS = 90          # disconnect after this long idle
+PLAYBACK_TIMEOUT = 45        # stop playback if it stalls
+DEFAULT_VOLUME = 0.30        # 30%
+
+# ---------- Intents ----------
 intents = discord.Intents.default()
 intents.voice_states = True
+intents.members = True
 intents.guilds = True
-intents.members = True  # enable in Dev Portal
+# message_content not required for this bot
 
-bot = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix=".", intents=intents, help_command=None)
 
-# Track initial members so we don't fire on startup presence
-initial_seen: Set[int] = set()
-# Per-guild connect locks to avoid parallel connects (which can cause 4006)
-guild_connect_locks: Dict[int, asyncio.Lock] = {}
-# Debounce joins per-user
-last_join_ts: Dict[int, float] = {}
-# Recent failures per guild
-recent_failures: Dict[int, tuple[int, float]] = {}
-# Linger disconnect tasks
-linger_tasks: Dict[int, asyncio.Task] = {}
+# Track users present when bot starts so we don't play for them immediately
+initial_users: set[int] = set()
+linger_tasks: dict[int, asyncio.Task] = {}
 
+# Per-guild connect/move serialization (prevents overlapping joins → 4006)
+_guild_voice_lock: dict[int, asyncio.Lock] = {}
+def _lock_for(guild_id: int) -> asyncio.Lock:
+    if guild_id not in _guild_voice_lock:
+        _guild_voice_lock[guild_id] = asyncio.Lock()
+    return _guild_voice_lock[guild_id]
+
+# ---------- FFmpeg / Opus ----------
 def log_ffmpeg():
     ff = shutil.which("ffmpeg")
-    log.info(f"ffmpeg found: {ff}")
+    logger.info(f"ffmpeg found: {ff if ff else 'NOT FOUND'}")
 
-def load_opus():
-    # On Linux with libopus0 installed, 'opus' should load
+def ensure_opus_loaded():
     if discord.opus.is_loaded():
+        logger.info("Opus already loaded")
         return
-    for name in ("opus", "libopus.so.0", "libopus"):
+    # Linux on Render usually has libopus.so.0
+    candidates: Iterable[str] = (
+        "libopus.so.0",
+        "opus",
+        "libopus-0.x64.dll",
+        "opus.dll",
+        "libopus.dll",
+    )
+    last = None
+    for c in candidates:
         try:
-            discord.opus.load_opus(name)
-            log.info(f"Opus loaded: {name}")
+            discord.opus.load_opus(c)
+            logger.info(f"Opus loaded: {c}")
             return
-        except Exception:
-            continue
-    log.warning("Opus failed to load; ensure libopus0 is installed in the container.")
+        except Exception as e:
+            last = e
+    logger.warning(f"Could not load Opus automatically ({last}). Voice may fail.")
 
-def audio_path_for_user(user_id: int) -> Optional[str]:
-    for ext in (".mp3", ".wav", ".ogg", ".m4a", ".flac"):
-        p = os.path.join(AUDIO_DIR, f"{user_id}{ext}")
-        if os.path.isfile(p):
-            return p
+# ---------- Audio lookup ----------
+AUDIO_EXTS = (".mp3", ".wav", ".ogg", ".flac", ".m4a")
+
+def find_user_audio(user_id: int) -> Optional[str]:
+    base = os.path.join(AUDIO_DIR, str(user_id))
+    for ext in AUDIO_EXTS:
+        path = base + ext
+        if os.path.isfile(path):
+            return path
     return None
 
-def should_attempt(guild_id: int) -> bool:
-    rec = recent_failures.get(guild_id)
-    if not rec:
-        return True
-    fails, ts = rec
-    if time.time() - ts > FAIL_WINDOW_SEC:
-        recent_failures.pop(guild_id, None)
-        return True
-    return fails < MAX_FAILS
+# ---------- Connect / Move (aggressive 4006 recovery) ----------
+async def connect_or_move(channel: discord.VoiceChannel, attempts: int = 2) -> Optional[discord.VoiceClient]:
+    """Serialized per-guild connect with proactive invalid-session clearing."""
+    guild = channel.guild
+    gid = guild.id
 
-def record_failure(gid: int):
-    fails, _ = recent_failures.get(gid, (0, 0.0))
-    recent_failures[gid] = (fails + 1, time.time())
+    async with _lock_for(gid):
+        existing = discord.utils.get(bot.voice_clients, guild=guild)
+        if existing and existing.is_connected():
+            if existing.channel and existing.channel.id == channel.id:
+                return existing
+            try:
+                await existing.move_to(channel)
+                logger.info(f"🔄 Moved to {channel.name}")
+                return existing
+            except Exception as e:
+                logger.warning(f"Move failed: {e}; resetting")
+                try:
+                    await existing.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.8)
 
-def record_success(gid: int):
-    recent_failures.pop(gid, None)
+        # Proactively tell Discord “we’re in no channel” before attempt #1
+        try:
+            await guild.change_voice_state(channel=None, self_mute=False, self_deaf=False)
+        except Exception:
+            pass
+        await asyncio.sleep(1.2)
 
+        last_exc: Optional[Exception] = None
+        for i in range(1, attempts + 1):
+            try:
+                logger.info(f"Connecting to {channel.name} (attempt {i}/{attempts})")
+
+                # Nudge gateway to place us in the channel first
+                try:
+                    await guild.change_voice_state(channel=channel, self_mute=False, self_deaf=False)
+                    await asyncio.sleep(0.8)
+                except Exception:
+                    pass
+
+                vc = await channel.connect(timeout=18.0, reconnect=False)
+                logger.info(f"✅ Connected to {channel.name}")
+                return vc
+
+            except discord.errors.ConnectionClosed as e:
+                last_exc = e
+                logger.warning(f"Connect error: {e}")
+                # 4006 invalid session: hard clear and retry
+                if e.code == 4006:
+                    try:
+                        ghost = discord.utils.get(bot.voice_clients, guild=guild)
+                        if ghost:
+                            await ghost.disconnect(force=True)
+                    except Exception:
+                        pass
+                    try:
+                        await guild.change_voice_state(channel=None, self_mute=False, self_deaf=False)
+                    except Exception:
+                        pass
+                    await asyncio.sleep(2.5)
+                else:
+                    await asyncio.sleep(1.5)
+
+            except asyncio.TimeoutError as e:
+                last_exc = e
+                logger.warning("Voice connect timeout")
+                try:
+                    await guild.change_voice_state(channel=None, self_mute=False, self_deaf=False)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.5)
+
+            except discord.ClientException as e:
+                last_exc = e
+                # Race: “already connected” → try move, else reset
+                try:
+                    vc2 = discord.utils.get(bot.voice_clients, guild=guild)
+                    if vc2:
+                        await vc2.move_to(channel)
+                        logger.info(f"Moved to {channel.name} after ClientException")
+                        return vc2
+                except Exception:
+                    pass
+                try:
+                    vc2 = discord.utils.get(bot.voice_clients, guild=guild)
+                    if vc2:
+                        await vc2.disconnect(force=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
+
+            except Exception as e:
+                last_exc = e
+                logger.warning(f"Connect error: {e}")
+                await asyncio.sleep(1.5)
+
+        logger.error(f"❌ Failed to connect to {channel.name}")
+        if last_exc:
+            logger.debug("Last exception:", exc_info=last_exc)
+        return None
+
+# ---------- Playback ----------
 async def disconnect_later(guild_id: int, delay: int):
     try:
         await asyncio.sleep(delay)
@@ -92,173 +201,111 @@ async def disconnect_later(guild_id: int, delay: int):
         if vc and vc.is_connected() and not vc.is_playing():
             try:
                 await vc.disconnect(force=True)
-                log.info("Disconnected after linger")
+                logger.info("🔌 Linger timeout — disconnected")
             except Exception as e:
-                log.warning(f"Linger disconnect failed: {e}")
+                logger.warning(f"Linger disconnect failed: {e}")
     finally:
         linger_tasks.pop(guild_id, None)
 
-async def play_clip(vc: discord.VoiceClient, path: str, who: str):
+async def play_clip(vc: discord.VoiceClient, path: str, member_name: str):
     gid = vc.guild.id
-    # cancel linger
+    # cancel any scheduled disconnect
     t = linger_tasks.pop(gid, None)
     if t and not t.done():
         t.cancel()
 
     if vc.is_playing():
         vc.stop()
-        await asyncio.sleep(0.25)
+        await asyncio.sleep(0.3)
 
     source = PCMVolumeTransformer(FFmpegPCMAudio(path), volume=DEFAULT_VOLUME)
     done = asyncio.Event()
 
     def _after(err: Optional[Exception]):
         if err:
-            log.error(f"Audio error: {err}")
+            logger.error(f"Audio error: {err}")
         try:
             bot.loop.call_soon_threadsafe(done.set)
         except Exception:
             pass
 
     vc.play(source, after=_after)
-    log.info(f"Playing {os.path.basename(path)} for {who}")
+    logger.info(f"🔊 Playing {os.path.basename(path)} for {member_name}")
+
     try:
         await asyncio.wait_for(done.wait(), timeout=PLAYBACK_TIMEOUT)
     except asyncio.TimeoutError:
+        logger.warning("⏱️ Playback timeout — stopping")
         vc.stop()
 
     if gid not in linger_tasks:
         linger_tasks[gid] = asyncio.create_task(disconnect_later(gid, LINGER_SECONDS))
 
-async def connect_or_move(channel: discord.VoiceChannel, attempts: int = 2) -> Optional[discord.VoiceClient]:
-    gid = channel.guild.id
-
-    if not should_attempt(gid):
-        log.warning(f"Too many recent failures for guild {gid}; skipping")
-        return None
-
-    lock = guild_connect_locks.setdefault(gid, asyncio.Lock())
-    async with lock:
-        # move if connected
-        vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
-        if vc and vc.is_connected():
-            if vc.channel and vc.channel.id == channel.id:
-                record_success(gid)
-                return vc
-            try:
-                await vc.move_to(channel)
-                log.info(f"Moved to {channel.name}")
-                record_success(gid)
-                return vc
-            except Exception as e:
-                log.warning(f"Move failed: {e}; reconnecting")
-
-        last_exc: Optional[Exception] = None
-        for i in range(1, attempts + 1):
-            try:
-                log.info(f"Connecting to {channel.name} (attempt {i}/{attempts})")
-                vc = await channel.connect(timeout=CONNECT_TIMEOUT, reconnect=False)
-                log.info(f"Connected to {channel.name}")
-                record_success(gid)
-                return vc
-
-            except discord.errors.ConnectionClosed as e:
-                last_exc = e
-                log.warning(f"Connect error: {e}")
-                # 4006 invalid session recovery
-                if e.code == 4006:
-                    try:
-                        ghost = discord.utils.get(bot.voice_clients, guild=channel.guild)
-                        if ghost:
-                            await ghost.disconnect(force=True)
-                    except Exception:
-                        pass
-                    try:
-                        await channel.guild.change_voice_state(channel=None, self_mute=False, self_deaf=False)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(2.5)
-                    try:
-                        await channel.guild.change_voice_state(channel=channel, self_mute=False, self_deaf=False)
-                    except Exception:
-                        pass
-                    await asyncio.sleep(1.5)
-                else:
-                    await asyncio.sleep(1.5)
-
-            except asyncio.TimeoutError as e:
-                last_exc = e
-                log.warning("Voice connect timeout")
-                await asyncio.sleep(1.5)
-
-            except discord.ClientException as e:
-                last_exc = e
-                # try move path
-                try:
-                    vc = discord.utils.get(bot.voice_clients, guild=channel.guild)
-                    if vc:
-                        await vc.move_to(channel)
-                        log.info(f"Moved to {channel.name} after ClientException")
-                        record_success(gid)
-                        return vc
-                except Exception:
-                    await asyncio.sleep(1.0)
-
-            except Exception as e:
-                last_exc = e
-                log.warning(f"Connect error: {e}")
-                await asyncio.sleep(1.5)
-
-        record_failure(gid)
-        log.error(f"Failed to connect to {channel.name}")
-        if last_exc:
-            log.debug("Last exception", exc_info=last_exc)
-        return None
-
+# ---------- Events ----------
 @bot.event
 async def on_ready():
     log_ffmpeg()
-    load_opus()
-    # collect initial users in voice to avoid firing immediately
-    initial_seen.clear()
+    ensure_opus_loaded()
+
+    # Build initial “present in voice” set to avoid playing immediately for current users
+    initial_users.clear()
     for g in bot.guilds:
         for m in g.members:
             if m.voice and m.voice.channel:
-                initial_seen.add(m.id)
-    log.info(f"Logged in as {bot.user}")
+                initial_users.add(m.id)
+
+    logger.info(f"Logged in as {bot.user}")
 
 @bot.event
 async def on_voice_state_update(member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
     if member.bot:
         return
-    # ignore moves/leaves
+    # no change
     if before.channel == after.channel:
         return
-    # only on joins
-    if before.channel is None and after.channel is not None:
-        now = time.time()
-        # if this was "skipped" at startup and they join later again, we will announce because we only skip once
-        if member.id in initial_seen:
-            # skip exactly once; remove so next join announces
-            initial_seen.discard(member.id)
-            return
-        # debounce same user rapid events
-        ts = last_join_ts.get(member.id, 0.0)
-        if now - ts < JOIN_DEBOUNCE_SEC:
-            return
-        last_join_ts[member.id] = now
 
-        path = audio_path_for_user(member.id)
+    # skip users who were already in voice when the bot started
+    if before.channel is None and after.channel and member.id in initial_users:
+        initial_users.discard(member.id)  # next time we will play
+        return
+
+    # join event
+    if before.channel is None and after.channel:
+        path = find_user_audio(member.id)
         if not path:
-            return  # no clip configured
+            # no file for this user; nothing to do
+            return
 
         vc = await connect_or_move(after.channel)
         if not vc or not vc.is_connected():
             return
+
         try:
             await play_clip(vc, path, member.display_name)
         except Exception as e:
-            log.error(f"Playback error: {e}")
+            logger.error(f"Playback error: {e}")
 
+# ---------- Simple command to test your own sound ----------
+@bot.command()
+async def test_sound(ctx: commands.Context, user_id: Optional[int] = None):
+    if not ctx.author.voice or not ctx.author.voice.channel:
+        return await ctx.send("Join a voice channel first.")
+    uid = user_id or ctx.author.id
+    path = find_user_audio(uid)
+    if not path:
+        return await ctx.send(f"No audio file found for `{uid}` in {AUDIO_DIR}.")
+    vc = await connect_or_move(ctx.author.voice.channel)
+    if not vc or not vc.is_connected():
+        return await ctx.send("Couldn't connect to voice.")
+    try:
+        await play_clip(vc, path, f"TestUser_{uid}")
+        await ctx.send("Test played.")
+    except Exception as e:
+        await ctx.send(f"Playback error: {e}")
+
+# ---------- Main ----------
 if __name__ == "__main__":
-    bot.run(TOKEN)
+    try:
+        bot.run(TOKEN)
+    except KeyboardInterrupt:
+        logger.info("Bye!")
