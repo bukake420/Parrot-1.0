@@ -1,0 +1,13 @@
+services:
+  - type: worker
+    name: audio-join-bot
+    env: docker
+    plan: starter
+    autoDeploy: true
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: LINGER_SECONDS
+        value: "120"
+      - key: PLAYBACK_VOLUME
+        value: "0.30"
